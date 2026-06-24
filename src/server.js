@@ -1,4 +1,4 @@
-// Mara renderer API release 5 — public URL fallback + render diagnostics
+// MaRa renderer API release 6 — stable Canvas capture + render-only rate limit
 import cors from 'cors';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
@@ -61,16 +61,15 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(
-  '/api/jobs',
-  rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 8,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Bạn đã tạo nhiều job render. Hãy đợi khoảng 15 phút rồi thử lại.' },
-  }),
-);
+// Only limit creation requests. Job polling uses GET /api/jobs/:id every few seconds
+// and must never consume the creation quota.
+const createJobRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Bạn đã tạo nhiều job render. Hãy đợi khoảng 15 phút rồi thử lại.' },
+});
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -101,6 +100,7 @@ app.get('/health', (_req, res) => {
     active: queueRunning,
     frontendUrl: FRONTEND_URL,
     publicBaseUrlConfigured: Boolean(PUBLIC_BASE_URL),
+    rendererVersion: 'release-6',
   });
 });
 
@@ -108,7 +108,7 @@ app.get('/', (_req, res) => {
   res.type('text/plain').send('MaRa Railway Renderer is running.');
 });
 
-app.post('/api/jobs', upload.array('assets', MAX_ASSETS), async (req, res) => {
+app.post('/api/jobs', createJobRateLimit, upload.array('assets', MAX_ASSETS), async (req, res) => {
   const uploadedFiles = Array.isArray(req.files) ? req.files : [];
 
   try {
@@ -505,7 +505,12 @@ async function renderJob(job) {
       throw new Error(message || 'Trang MaRa Slide không thể tải project render từ Railway.');
     }
 
-    const canvas = page.locator('#mara-server-render-canvas');
+    await page.waitForFunction(
+      () => document.getElementById('mara-server-render-canvas') instanceof HTMLCanvasElement,
+      null,
+      { timeout: 30_000 },
+    );
+
     const videoOnlyPath = path.join(job.jobDir, 'video-only.mp4');
     const profile = renderProfile(job.options.quality);
 
@@ -517,7 +522,6 @@ async function renderJob(job) {
     await streamFramesToFfmpeg({
       job,
       page,
-      canvas,
       totalFrames,
       fps,
       totalDuration,
@@ -546,7 +550,7 @@ async function renderJob(job) {
   }
 }
 
-async function streamFramesToFfmpeg({ job, page, canvas, totalFrames, fps, totalDuration, width, height, videoOnlyPath, profile }) {
+async function streamFramesToFfmpeg({ job, page, totalFrames, fps, totalDuration, width, height, videoOnlyPath, profile }) {
   const ffmpeg = spawn('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'image2pipe', '-vcodec', 'png', '-framerate', String(fps), '-i', 'pipe:0',
@@ -569,13 +573,35 @@ async function streamFramesToFfmpeg({ job, page, canvas, totalFrames, fps, total
     for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
       if (job.cancelled) throw new Error('Job đã bị hủy.');
       const timelineTime = Math.min(totalDuration, frameIndex / fps);
-      await page.evaluate(({ timelineTime, width, height }) => {
+
+      /*
+        Never use Locator.screenshot() here. Playwright waits for a DOM element
+        to become stable and can throw "Element is not attached to the DOM"
+        when React updates the render page. Rendering and reading canvas pixels
+        happen in ONE page.evaluate call instead, so every frame comes from the
+        current canvas synchronously and CSS/font animations are irrelevant.
+      */
+      const dataUrl = await page.evaluate(({ timelineTime, width, height }) => {
         const bridge = globalThis.__MARA_RENDER_BRIDGE__;
         if (!bridge?.ready) throw new Error('Canvas renderer chưa sẵn sàng.');
+
         bridge.renderAt(timelineTime, width, height);
+        const canvas = document.getElementById('mara-server-render-canvas');
+        if (!(canvas instanceof HTMLCanvasElement)) {
+          throw new Error('Không tìm thấy canvas server render.');
+        }
+
+        try {
+          return canvas.toDataURL('image/png');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`Không thể đọc khung hình Canvas: ${message}`);
+        }
       }, { timelineTime, width, height });
 
-      const png = await canvas.screenshot({ type: 'png', animations: 'disabled' });
+      const commaIndex = dataUrl.indexOf(',');
+      if (commaIndex < 0) throw new Error('Canvas không trả về dữ liệu PNG hợp lệ.');
+      const png = Buffer.from(dataUrl.slice(commaIndex + 1), 'base64');
       if (!ffmpeg.stdin.write(png)) await once(ffmpeg.stdin, 'drain');
 
       if (frameIndex % 6 === 0 || frameIndex === totalFrames - 1) {
