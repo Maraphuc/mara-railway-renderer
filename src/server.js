@@ -1,4 +1,4 @@
-// Mara renderer API release 4
+// Mara renderer API release 5 — public URL fallback + render diagnostics
 import cors from 'cors';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
@@ -12,7 +12,15 @@ import { chromium } from 'playwright';
 
 const PORT = Number(process.env.PORT || 3000);
 const FRONTEND_URL = trimTrailingSlash(process.env.FRONTEND_URL || 'https://slidemara.vercel.app');
-const PUBLIC_BASE_URL = trimTrailingSlash(process.env.PUBLIC_BASE_URL || '');
+
+/*
+  Prefer PUBLIC_BASE_URL, but fall back to Railway's automatically supplied
+  public domain. This prevents the headless Vercel renderer from receiving an
+  empty `api` query parameter when PUBLIC_BASE_URL was not manually added.
+*/
+const PUBLIC_BASE_URL = normalizePublicBaseUrl(
+  process.env.PUBLIC_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '',
+);
 const JOB_ROOT = process.env.JOB_ROOT || '/tmp/mara-render-jobs';
 const MAX_UPLOAD_MB = clampNumber(process.env.MAX_UPLOAD_MB, 300, 20, 900);
 const MAX_VIDEO_SECONDS = clampNumber(process.env.MAX_VIDEO_SECONDS, 180, 10, 600);
@@ -86,7 +94,14 @@ const upload = multer({
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'mara-railway-renderer', queue: queue.length, active: queueRunning });
+  res.json({
+    ok: true,
+    service: 'mara-railway-renderer',
+    queue: queue.length,
+    active: queueRunning,
+    frontendUrl: FRONTEND_URL,
+    publicBaseUrlConfigured: Boolean(PUBLIC_BASE_URL),
+  });
 });
 
 app.get('/', (_req, res) => {
@@ -240,10 +255,19 @@ setInterval(() => {
 app.listen(PORT, () => {
   console.log(`MaRa renderer listening on :${PORT}`);
   console.log(`FRONTEND_URL=${FRONTEND_URL}`);
+  console.log(`PUBLIC_BASE_URL=${PUBLIC_BASE_URL || '(missing)'}`);
 });
 
+function normalizePublicBaseUrl(value) {
+  const normalized = String(value || '').trim().replace(/\/+$/, '');
+  if (!normalized) return '';
+  return /^https?:\/\//i.test(normalized)
+    ? normalized
+    : `https://${normalized}`;
+}
+
 function trimTrailingSlash(value) {
-  return value.replace(/\/$/, '');
+  return String(value || '').replace(/\/$/, '');
 }
 
 function clampNumber(rawValue, fallback, min, max) {
@@ -420,6 +444,24 @@ async function renderJob(job) {
   job.progress = 2;
   job.updatedAt = Date.now();
 
+  if (!PUBLIC_BASE_URL) {
+    throw new Error(
+      'Thiếu PUBLIC_BASE_URL trên Railway. Hãy đặt giá trị https://mara-railway-renderer-production.up.railway.app rồi deploy lại service.',
+    );
+  }
+
+  // Verify the temporary project API before Chromium opens the Vercel app.
+  // This turns the previous generic “Không thể tải dữ liệu…” into a useful
+  // Railway-side error if the URL, job token, or service routing is incorrect.
+  const projectUrl = `${PUBLIC_BASE_URL}/api/jobs/${encodeURIComponent(job.id)}/project?token=${encodeURIComponent(job.token)}`;
+  const projectProbe = await fetch(projectUrl);
+  if (!projectProbe.ok) {
+    const body = await projectProbe.text().catch(() => '');
+    throw new Error(
+      `Railway không đọc được dữ liệu project (HTTP ${projectProbe.status}). ${body.slice(0, 300)}`,
+    );
+  }
+
   const output = renderDimensions(job.project.aspectRatio, job.options.resolution);
   const fps = 30;
   const totalDuration = calculateDuration(job.project.slides);
@@ -431,7 +473,22 @@ async function renderJob(job) {
   });
 
   try {
+    page.on('console', (message) => {
+      if (message.type() === 'error' || message.type() === 'warning') {
+        console.log(`[renderer browser ${job.id}] ${message.type()}: ${message.text()}`);
+      }
+    });
+    page.on('pageerror', (error) => {
+      console.error(`[renderer browser ${job.id}] page error:`, error.message);
+    });
+    page.on('response', (response) => {
+      if (response.url().includes('/api/jobs/')) {
+        console.log(`[renderer browser ${job.id}] ${response.status()} ${response.url()}`);
+      }
+    });
+
     const rendererUrl = `${FRONTEND_URL}/?maraRender=1&job=${encodeURIComponent(job.id)}&token=${encodeURIComponent(job.token)}&api=${encodeURIComponent(PUBLIC_BASE_URL)}`;
+    console.log(`[render ${job.id}] Opening renderer URL: ${rendererUrl}`);
     await page.goto(rendererUrl, { waitUntil: 'domcontentloaded', timeout: 90_000 });
     await page.waitForFunction(
       () =>
