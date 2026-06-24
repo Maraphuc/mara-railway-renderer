@@ -1,4 +1,3 @@
-import cors from 'cors';
 import crypto from 'node:crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
@@ -29,14 +28,54 @@ let activeJob = null;
 await fs.mkdir(path.join(JOB_ROOT, 'incoming'), { recursive: true });
 await fs.mkdir(path.join(JOB_ROOT, 'jobs'), { recursive: true });
 
-const allowedOrigins = new Set([FRONTEND_URL, ...String(process.env.FRONTEND_ORIGINS || '').split(',').map(trimTrailingSlash).filter(Boolean)]);
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(trimTrailingSlash(origin))) return callback(null, true);
-    return callback(new Error('Origin không được phép gọi Render Server.'));
-  },
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-}));
+/**
+ * CORS is handled explicitly before every route so success responses, validation errors,
+ * rate-limit responses, and polling responses all carry the same headers.
+ * The API is still limited to the configured MaRa Slide origins; it is not opened to every site.
+ */
+const allowedOrigins = new Set([
+  FRONTEND_URL,
+  ...String(process.env.FRONTEND_ORIGINS || '')
+    .split(',')
+    .map(trimTrailingSlash)
+    .filter(Boolean),
+]);
+
+function requestOriginIsAllowed(origin) {
+  if (!origin) return true; // Railway health checks / direct browser visits do not send Origin.
+  return allowedOrigins.has(trimTrailingSlash(origin));
+}
+
+app.use((req, res, next) => {
+  const origin = req.get('origin');
+  const isAllowed = requestOriginIsAllowed(origin);
+
+  // Set CORS headers before any route, multer, rate limiter, or error handler responds.
+  if (origin && isAllowed) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      req.get('access-control-request-headers') || 'Content-Type, Authorization',
+    );
+    res.setHeader('Access-Control-Max-Age', '86400');
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (!isAllowed) {
+      return res.status(403).json({ error: 'Origin không được phép gọi Render Server.' });
+    }
+    return res.status(204).end();
+  }
+
+  if (origin && !isAllowed) {
+    return res.status(403).json({ error: 'Origin không được phép gọi Render Server.' });
+  }
+
+  return next();
+});
+
 app.use(express.json({ limit: '1mb' }));
 
 const upload = multer({
@@ -60,7 +99,17 @@ app.use('/api/jobs', rateLimit({
 }));
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'mara-capcut-pro-renderer', rendererVersion: RENDERER_VERSION, queue: queue.length, active: Boolean(activeJob), frontendUrl: FRONTEND_URL, publicBaseUrlConfigured: Boolean(PUBLIC_BASE_URL), engine: 'deterministic-node-canvas-ffmpeg' });
+  res.json({
+    ok: true,
+    service: 'mara-capcut-pro-renderer',
+    rendererVersion: RENDERER_VERSION,
+    queue: queue.length,
+    active: Boolean(activeJob),
+    frontendUrl: FRONTEND_URL,
+    allowedOrigins: [...allowedOrigins],
+    publicBaseUrlConfigured: Boolean(PUBLIC_BASE_URL),
+    engine: 'deterministic-node-canvas-ffmpeg',
+  });
 });
 app.get('/', (_req, res) => res.type('text/plain').send('MaRa CapCut Pro Render Engine is running.'));
 
@@ -121,6 +170,7 @@ setInterval(() => { void cleanupExpiredJobs(); }, 10 * 60 * 1000).unref();
 app.listen(PORT, () => {
   console.log(`MaRa CapCut Pro renderer listening on :${PORT}`);
   console.log(`FRONTEND_URL=${FRONTEND_URL}`);
+  console.log(`ALLOWED_ORIGINS=${[...allowedOrigins].join(',')}`);
   console.log(`PUBLIC_BASE_URL=${PUBLIC_BASE_URL || '(missing)'}`);
 });
 
