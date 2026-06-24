@@ -1,0 +1,16 @@
+{
+  "name": "mara-railway-renderer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "multer": "^2.0.2",
+    "playwright": "1.55.0"
+  }
+}
