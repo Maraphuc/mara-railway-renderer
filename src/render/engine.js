@@ -44,7 +44,7 @@ async function preloadProjectImages(project, assets) {
 function rawCanvasBuffer(canvas) {
   const raw = canvas.data();
   if (!Buffer.isBuffer(raw) || raw.length !== canvas.width * canvas.height * 4) {
-    throw new Error('Canvas renderer không tạo được raw frame BGRA hợp lệ.');
+    throw new Error('Canvas renderer không tạo được raw frame RGBA hợp lệ.');
   }
   return raw;
 }
@@ -111,7 +111,9 @@ export async function renderProjectToVideo({ job, signal, onStage, onProgress })
   const videoOnlyPath = path.join(job.jobDir, 'video-only.mp4');
   const ffmpeg = spawn('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
-    '-f', 'rawvideo', '-pix_fmt', 'bgra', '-s', `${width}x${height}`, '-r', String(fps), '-i', 'pipe:0',
+    // @napi-rs/canvas canvas.data() returns bytes in RGBA order.
+    // Feeding FFmpeg as BGRA swaps red and blue, producing incorrect colours.
+    '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${width}x${height}`, '-r', String(fps), '-i', 'pipe:0',
     '-an', '-c:v', 'libx264', '-preset', profile.preset, '-crf', String(profile.crf),
     '-pix_fmt', 'yuv420p', '-r', String(fps), '-movflags', '+faststart', videoOnlyPath,
   ], { stdio: ['pipe', 'ignore', 'pipe'] });
