@@ -1,0 +1,17 @@
+{
+  "name": "mara-capcut-pro-renderer",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/render/engine.js && node --check src/render/draw.js && node --check src/render/utils.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "multer": "^2.0.2"
+  }
+}
